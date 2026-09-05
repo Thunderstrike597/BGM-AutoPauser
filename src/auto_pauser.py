@@ -109,6 +109,17 @@ if getattr(sys, "frozen", False):
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+
+def resource_path(*parts):
+    """Locates a bundled read-only resource (e.g. assets/icon.ico) rather
+    than a writable config/settings file - these live in different places
+    once frozen. PyInstaller's bootloader sets sys._MEIPASS to wherever it
+    unpacked bundled data (the _internal folder, for a onedir build);
+    unfrozen, it's just next to this script, same as BASE_DIR."""
+    base = getattr(sys, "_MEIPASS", BASE_DIR) if getattr(sys, "frozen", False) else BASE_DIR
+    return os.path.join(base, *parts)
+
+
 SETTINGS_FILE = os.path.join(BASE_DIR, "auto_pauser_settings.json")
 DEFAULT_SETTINGS = {"fade_enabled": True, "mute_mode": False}
 
@@ -327,9 +338,9 @@ def _ps_quote(value):
     return "'" + str(value).replace("'", "''") + "'"
 
 
-def create_playlist_shortcut(playlist_dir, name, pin_to_start):
-    """Creates a direct .lnk shortcut pointing directly to the application 
-    executable with the --launchPlaylist argument included, bypassing the 
+def create_playlist_shortcut(playlist_dir, name):
+    """Creates a direct .lnk shortcut pointing directly to the application
+    executable with the --launchPlaylist argument included, bypassing the
     need for any intermediate .bat files."""
     os.makedirs(SHORTCUTS_DIR, exist_ok=True)
 
@@ -337,12 +348,11 @@ def create_playlist_shortcut(playlist_dir, name, pin_to_start):
     lnk_path = _unique_path(os.path.join(SHORTCUTS_DIR, safe_name + ".lnk"))
 
     # Determine what the base application is (the compiled exe or python interpreter)
+    target_exe = sys.executable
     if getattr(sys, "frozen", False):
-        target_exe = sys.executable
         arguments = f'--launchPlaylist "{playlist_dir}"'
     else:
         # Running from source code (.py file)
-        target_exe = sys.executable
         arguments = f'"{os.path.abspath(__file__)}" --launchPlaylist "{playlist_dir}"'
 
     ps_lines = [
@@ -354,16 +364,6 @@ def create_playlist_shortcut(playlist_dir, name, pin_to_start):
         f"$sc.IconLocation = {_ps_quote(target_exe + ',0')}",
         "$sc.Save()",
     ]
-    if pin_to_start:
-        # Best-effort attempt to pin the shortcut directly to the Start Menu
-        ps_lines += [
-            "try {",
-            "  $shellApp = New-Object -ComObject Shell.Application",
-            f"  $folder = $shellApp.Namespace({_ps_quote(SHORTCUTS_DIR)})",
-            f"  $item = $folder.ParseName({_ps_quote(os.path.basename(lnk_path))})",
-            "  $item.InvokeVerb('pintostartscreen')",
-            "} catch {}",
-        ]
 
     script = "\n".join(ps_lines)
     encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
@@ -391,8 +391,8 @@ def _reveal_in_explorer(path):
 
 
 def _ask_shortcut_details(root, default_name):
-    """Small modal dialog: shortcut name + Pin to Start checkbox.
-    Returns (name, pin_to_start), or None if cancelled."""
+    """Small modal dialog: shortcut name + "open its folder afterward" checkbox.
+    Returns (name, open_location), or None if cancelled."""
     dialog = tk.Toplevel(root)
     dialog.title("New Playlist Shortcut")
     dialog.resizable(False, False)
@@ -406,13 +406,13 @@ def _ask_shortcut_details(root, default_name):
     entry.focus_set()
     entry.select_range(0, "end")
 
-    pin_var = tk.BooleanVar(value=True)
-    tk.Checkbutton(dialog, text="Open Shortcut Location", variable=pin_var).grid(
+    open_location_var = tk.BooleanVar(value=True)
+    tk.Checkbutton(dialog, text="Open Shortcut Location", variable=open_location_var).grid(
         row=2, column=0, columnspan=2, sticky="w", padx=12
     )
 
     def on_ok(event=None):
-        result["value"] = (name_var.get().strip(), pin_var.get())
+        result["value"] = (name_var.get().strip(), open_location_var.get())
         dialog.destroy()
 
     def on_cancel(event=None):
@@ -442,10 +442,10 @@ def _ask_shortcut_details(root, default_name):
 
 
 def _new_playlist_shortcut_flow(root):
-    """Runs entirely on the Tk thread: folder picker -> name/pin dialog ->
-    create the shortcut -> confirm (and open Explorer with it selected, so
-    Pin to Start can be finished by hand if the automatic attempt didn't
-    take - see create_playlist_shortcut())."""
+    """Runs entirely on the Tk thread: folder picker -> name/checkbox dialog
+    -> create the shortcut -> confirm, optionally opening Explorer with it
+    selected (there's no reliable way to pin to Start programmatically
+    anymore on modern Windows, so this is the one-click-away substitute)."""
     playlist_dir = filedialog.askdirectory(title="Choose the playlist folder for this shortcut", mustexist=True)
     if not playlist_dir:
         return
@@ -454,22 +454,18 @@ def _new_playlist_shortcut_flow(root):
     details = _ask_shortcut_details(root, default_name=os.path.basename(playlist_dir) or "Playlist")
     if details is None:
         return
-    name, pin_to_start = details
+    name, open_location = details
 
     try:
-        lnk_path = create_playlist_shortcut(playlist_dir, name, pin_to_start)
+        lnk_path = create_playlist_shortcut(playlist_dir, name)
     except Exception as e:
         logging.error(f"[shortcut] failed to create playlist shortcut: {e}")
         messagebox.showerror("Shortcut creation failed", f"Something went wrong:\n{e}")
         return
 
-    _reveal_in_explorer(lnk_path)
-    note = (
-        "\n\nA \"Pin to Start\" attempt was made, but Windows doesn't always "
-        "allow this - if it didn't show up, right-click the shortcut "
-        "(now selected in Explorer) and choose Pin to Start yourself."
-        if pin_to_start else ""
-    )
+    if open_location:
+        _reveal_in_explorer(lnk_path)
+    
 
 
 def ensure_vlc_ready(controller, vlc_cfg, playlist):
@@ -486,7 +482,11 @@ def ensure_vlc_ready(controller, vlc_cfg, playlist):
     (--extraintf http --http-password ... --http-port ...), so nothing
     needs to be configured by hand.
     """
-    if controller.status() is not None:
+    # Fast, single-shot check: "not reachable yet" is the normal case on a
+    # cold start (VLC hasn't been launched yet at all), and this runs in the
+    # background (see main()) - but keeping it quick still matters, since a
+    # slow answer here delays the taskkill+relaunch decision either way.
+    if controller.status(retries=0, timeout=0.75) is not None:
         logging.info("[vlc] web interface already reachable - leaving the running VLC alone")
         return
 
@@ -576,11 +576,11 @@ class VLCController:
         auth = base64.b64encode(f":{password}".encode()).decode()
         self.headers = {"Authorization": f"Basic {auth}"}
 
-    def _get(self, path, retries=1):
+    def _get(self, path, retries=1, timeout=3.0):
         req = urllib.request.Request(self.base_url + path, headers=self.headers)
         for attempt in range(retries + 1):
             try:
-                with urllib.request.urlopen(req, timeout=3.0) as resp:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
                     data = resp.read()
                     if DEBUG:
                         print(f"[vlc] GET {path} -> HTTP {resp.status}")
@@ -594,8 +594,8 @@ class VLCController:
                     print(f"[vlc] connection error for {path} (attempt {attempt + 1}): {e}")
         return None
 
-    def _status_dict(self):
-        data = self._get("/status.json")
+    def _status_dict(self, retries=1, timeout=3.0):
+        data = self._get("/status.json", retries=retries, timeout=timeout)
         if data is None:
             return None
         try:
@@ -605,9 +605,12 @@ class VLCController:
                 print("[vlc] failed to parse status response")
             return None
 
-    def status(self):
-        """Returns 'playing', 'paused', 'stopped', or None if VLC/web iface unreachable."""
-        d = self._status_dict()
+    def status(self, retries=1, timeout=3.0):
+        """Returns 'playing', 'paused', 'stopped', or None if VLC/web iface unreachable.
+        retries/timeout are overridable - ensure_vlc_ready() uses a fast, single-shot
+        check since "not reachable yet" is the common case on a cold start and
+        shouldn't block the tray icon from appearing while it waits this out."""
+        d = self._status_dict(retries=retries, timeout=timeout)
         return d.get("state") if d else None
 
     def get_volume(self):
@@ -855,6 +858,25 @@ def make_icon_image(color):
     return img
 
 
+def _load_tray_icon_images():
+    """Loads the app's own icon (assets/icon.ico - the same file used for
+    the .exe's own icon in the .spec) for the tray, deriving a dimmed
+    grayscale version for the "disabled" state from it. Falls back to a
+    plain drawn dot if the asset is missing - e.g. running from source
+    without an assets/ folder next to the script, or a build made before
+    the asset existed - so a missing icon never crashes the app."""
+    icon_path = resource_path("assets", "icon.ico")
+    try:
+        base = Image.open(icon_path).convert("RGBA")
+    except (FileNotFoundError, OSError) as e:
+        logging.warning(f"[tray] couldn't load {icon_path}, using fallback icon: {e}")
+        return make_icon_image((40, 180, 99, 255)), make_icon_image((150, 150, 150, 255))
+
+    dimmed = base.convert("L").convert("RGBA")
+    dimmed.putalpha(base.split()[3])  # keep the original transparency mask
+    return base, dimmed
+
+
 # ----------------------------------------------------------------------
 # Volume slider popup
 # ----------------------------------------------------------------------
@@ -958,8 +980,7 @@ def _tk_ui_loop(ui_queue: "queue.Queue", pauser: AutoPauser):
 
 
 def run_tray(pauser: AutoPauser, ui_queue: "queue.Queue"):
-    icon_on = make_icon_image((40, 180, 99, 255))
-    icon_off = make_icon_image((150, 150, 150, 255))
+    icon_on, icon_off = _load_tray_icon_images()
 
     def toggle_enabled(icon, item):
         if pauser.enabled:
@@ -1054,7 +1075,16 @@ def main():
     controller = VLCController(VLC_HOST, vlc_cfg.get("http_port", 8080), vlc_cfg.get("http_password", ""))
 
     playlist = (args.playlist or vlc_cfg.get("default_playlist") or "").strip() or None
-    ensure_vlc_ready(controller, vlc_cfg, playlist)
+
+    # This used to run inline here, which meant nothing appeared - no tray
+    # icon, nothing - until VLC was confirmed reachable or relaunched. Now it
+    # runs alongside everything else: the tray icon and pauser loop show up
+    # immediately, and VLC calls the pauser loop makes in the meantime just
+    # get "unreachable" (None) until this finishes, same as it already
+    # handles any other time VLC isn't responding yet.
+    threading.Thread(
+        target=ensure_vlc_ready, args=(controller, vlc_cfg, playlist), daemon=True
+    ).start()
 
     pauser = AutoPauser(controller)
     t = threading.Thread(target=pauser.loop, daemon=True)
