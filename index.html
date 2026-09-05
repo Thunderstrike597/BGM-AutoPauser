@@ -1,1 +1,370 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BGM-AutoPauser | A Music Player Tool</title>
+    <meta name="description" content="BGM-AutoPauser automatically pauses and resumes your background music when other sound is playing — videos, games, streams, and more. Works with VLC from the system tray.">
 
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/daisyui@5/dist/full.css" type="text/css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/daisyui@5/themes.css" type="text/css">
+
+    <link rel="icon" href="/favicon.ico?v=2" type="image/x-icon">
+    <link rel="shortcut icon" href="/favicon.ico?v=2" type="image/x-icon">
+    <link rel="apple-touch-icon" href="/favicon.ico?v=2">
+
+    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@latest/tabler-icons.min.css">
+
+    <style>
+        .bounce-wrap {
+            display: inline-flex;
+            transition: transform 0.3s cubic-bezier(0.34, 1.56, 0.64, 1),
+                        filter 0.3s ease;
+        }
+        a.bounce-wrap.w-full {
+            display: flex;
+            width: 100%;
+        }
+        .bounce-wrap:hover {
+            transform: translateY(-5px) scale(1.04);
+            filter: drop-shadow(0 10px 18px rgba(0, 0, 0, 0.5));
+        }
+        .bounce-wrap:active {
+            transform: translateY(1px) scale(0.98);
+            filter: none;
+        }
+        .release-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            background: #16161c;
+            color: #fff;
+            font-weight: 900;
+            font-size: 0.95rem;
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+            padding: 0.7rem 1.35rem;
+            border-radius: 9999px;
+            border: 1px solid rgba(255,255,255,0.06);
+            box-shadow: 0 4px 14px rgba(0,0,0,0.4);
+        }
+        .projects-pill {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.55rem;
+            width: 100%;
+            background: #121218;
+            color: #fff;
+            font-weight: 900;
+            font-size: 1.35rem;
+            letter-spacing: 0.01em;
+            padding: 0.95rem 1.5rem;
+            border-radius: 9999px;
+            border: 1px solid rgba(255,255,255,0.08);
+            box-shadow: 0 6px 18px rgba(0,0,0,0.45);
+        }
+        @media (min-width: 640px) {
+            .projects-pill { font-size: 1.65rem; }
+        }
+        .nav-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.45rem;
+            background: #1a1a20;
+            color: #fff;
+            font-weight: 700;
+            font-size: 0.9rem;
+            letter-spacing: 0.02em;
+            padding: 0.45rem 0.95rem;
+            border-radius: 9999px;
+            border: 1px solid rgba(255,255,255,0.06);
+            box-shadow: 0 3px 10px rgba(0,0,0,0.35);
+            white-space: nowrap;
+        }
+        .nav-pill .twitch-icon {
+            color: #9146FF;
+            font-size: 1.15rem;
+        }
+        .nav-pill .github-icon {
+            font-size: 1.15rem;
+        }
+        .logo-bounce {
+            animation: soft-bounce 2.4s ease-in-out infinite;
+        }
+        @keyframes soft-bounce {
+            0%, 100% { transform: translateY(0); }
+            50% { transform: translateY(-8px); }
+        }
+        .banner-curve {
+            position: relative;
+            background: #0c0c10;
+            border-bottom-left-radius: 50% 28px;
+            border-bottom-right-radius: 50% 28px;
+            padding-bottom: 1.75rem;
+            overflow: visible;
+            z-index: 20;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+        }
+        .banner-curve::after {
+            content: "";
+            position: absolute;
+            left: 0;
+            right: 0;
+            bottom: -1px;
+            height: 28px;
+            pointer-events: none;
+            background: radial-gradient(ellipse 100% 100% at 50% 0%,
+                rgba(0,0,0,0.25) 0%,
+                transparent 70%);
+            border-bottom-left-radius: 50% 28px;
+            border-bottom-right-radius: 50% 28px;
+        }
+        .info-card {
+            background: #1e1e24;
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 1.25rem;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+        }
+        .panel-2a {
+            background: #2a2a32;
+            border-radius: 1.5rem;
+            box-shadow: 0 12px 40px rgba(0,0,0,0.4);
+        }
+        .section-bar {
+            height: 10px;
+            background: linear-gradient(90deg, #1a1a20, #2a2a32, #1a1a20);
+            border-top: 1px solid rgba(255,255,255,0.06);
+            border-bottom: 1px solid rgba(255,255,255,0.06);
+        }
+        .pause-logo {
+            width: 3.25rem;
+            height: 3.25rem;
+            border-radius: 9999px;
+            background: linear-gradient(135deg, #5b6cff 0%, #7b3ff0 100%);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 6px 18px rgba(91, 108, 255, 0.35);
+            flex-shrink: 0;
+        }
+        @media (min-width: 640px) {
+            .pause-logo {
+                width: 3.75rem;
+                height: 3.75rem;
+            }
+        }
+        .pause-logo .bars {
+            display: flex;
+            gap: 0.35rem;
+            height: 42%;
+        }
+        .pause-logo .bars span {
+            width: 0.35rem;
+            background: #fff;
+            border-radius: 2px;
+        }
+    </style>
+</head>
+<body class="bg-[#121216] text-base-content antialiased selection:bg-primary selection:text-primary-content">
+
+    <!-- TOP BANNER -->
+    <header class="banner-curve w-full px-4 sm:px-8 pt-4 relative">
+        <div class="absolute inset-0 bg-gradient-to-r from-primary/10 via-transparent to-secondary/10 pointer-events-none rounded-[inherit]"></div>
+        <div class="relative max-w-6xl mx-auto flex items-center justify-between gap-3 sm:gap-6">
+            <div class="flex items-center gap-3 sm:gap-4 min-w-0">
+                <div class="pause-logo logo-bounce" aria-hidden="true">
+                    <div class="bars">
+                        <span></span>
+                        <span></span>
+                    </div>
+                </div>
+                <div class="min-w-0">
+                    <h1 class="text-lg sm:text-2xl md:text-3xl lg:text-4xl font-black tracking-tight text-white leading-none drop-shadow-[0_2px_0_rgba(0,0,0,0.8)]">
+                        BGM - AutoPauser
+                        <span class="hidden sm:inline text-white/50 font-bold mx-1.5 sm:mx-2">|</span>
+                        <span class="block sm:inline text-xs sm:text-base md:text-lg lg:text-xl font-bold text-white tracking-wide mt-1 sm:mt-0">
+                            A Music Player Tool!
+                        </span>
+                    </h1>
+                </div>
+            </div>
+
+            <div class="flex items-center gap-2 sm:gap-3 shrink-0">
+                <a href="https://www.youtube.com/@KenjisCommentary"
+                   target="_blank"
+                   rel="noopener noreferrer"
+                   class="bounce-wrap"
+                   title="YouTube - KenjisCommentary">
+                    <span class="nav-pill pointer-events-none">
+                        <span>YouTube -</span>
+                        <i class="ti ti-brand-youtube"></i>
+                    </span>
+                </a>
+                <a href="https://www.twitch.tv/thekahnkenji"
+                   target="_blank"
+                   rel="noopener noreferrer"
+                   class="bounce-wrap"
+                   title="Twitch - thekahnkenji">
+                    <span class="nav-pill pointer-events-none">
+                        <span>Twitch -</span>
+                        <i class="ti ti-brand-twitch twitch-icon"></i>
+                    </span>
+                </a>
+                <a href="https://github.com/Thunderstrike597/BGM-AutoPauser"
+                   target="_blank"
+                   rel="noopener noreferrer"
+                   class="bounce-wrap"
+                   title="GitHub Repository">
+                    <span class="nav-pill pointer-events-none">
+                        <span>Github Page -</span>
+                        <i class="ti ti-brand-github github-icon"></i>
+                    </span>
+                </a>
+            </div>
+        </div>
+    </header>
+
+    <!-- HERO -->
+    <section class="w-full">
+        <div class="max-w-6xl mx-auto px-4 sm:px-8 py-8 md:py-10 grid grid-cols-1 lg:grid-cols-12 gap-6 lg:gap-8 items-start">
+
+            <!-- LEFT cards -->
+            <div class="lg:col-span-6 flex flex-col gap-3.5">
+
+                <div class="info-card px-5 py-5">
+                    <h2 class="text-lg sm:text-xl font-black text-primary mb-2.5 tracking-wide">
+                        ---What Does This Do?---
+                    </h2>
+                    <p class="text-base-content/90 text-base sm:text-[1.05rem] leading-relaxed mb-3">
+                        The Purpose of <span class="text-primary font-bold">BGM-AutoPauser</span> is simply put-
+                    </p>
+                    <p class="text-base-content/90 text-base sm:text-[1.05rem] leading-relaxed">
+                        A tool which automatically pauses/resumes background music depending on if there is
+                        sound being currently played
+                        <span class="text-base-content/70">(eg. a <span class="text-white font-semibold">video</span>,
+                        a <span class="text-white font-semibold">game</span>,
+                        <span class="text-white font-semibold">live stream</span>,
+                        <span class="text-white font-semibold">music</span> etc.)</span>
+                    </p>
+                </div>
+
+                <div class="info-card px-5 py-5">
+                    <h2 class="text-lg sm:text-xl font-black text-warning mb-2.5 tracking-wide">
+                        ---Requirements---
+                    </h2>
+                    <p class="text-base-content/90 text-base sm:text-[1.05rem] leading-relaxed mb-3">
+                        In Order for this to work all you need is <span class="text-white font-bold">VLC Media Player</span> Installed.
+                    </p>
+                    <p class="text-base-content/90 text-base sm:text-[1.05rem] leading-relaxed">
+                        VLC media Player can be found at -
+                        <a href="https://www.videolan.org/vlc/"
+                           target="_blank"
+                           rel="noopener noreferrer"
+                           class="text-sky-400 font-bold underline underline-offset-2 hover:text-sky-300 break-all">
+                            https://www.videolan.org/vlc/
+                        </a>
+                    </p>
+                </div>
+
+                <div class="info-card px-5 py-5">
+                    <h2 class="text-lg sm:text-xl font-black text-secondary mb-2.5 tracking-wide">
+                        ---Extra Info---
+                    </h2>
+                    <p class="text-base-content/90 text-base sm:text-[1.05rem] leading-relaxed">
+                        This app has no ‘window’ to open, rather it sits in the system tray,
+                        <span class="text-base-content/70">(In the bottom right corner of your taskbar!)</span>
+                    </p>
+                </div>
+
+            </div>
+
+            <!-- RIGHT panel -->
+            <div class="lg:col-span-6">
+                <div class="panel-2a p-5 sm:p-6 flex flex-col gap-4">
+
+                    <div class="relative">
+                        <span class="absolute -top-8 right-2 badge badge-error font-bold uppercase tracking-wider text-xs px-3 py-2 shadow">
+                            Desktop App
+                        </span>
+
+                        <h3 class="text-2xl font-black mb-2 flex items-center gap-2 text-white">
+                            <i class="ti ti-sparkles text-warning"></i>
+                            Ready to Use
+                        </h3>
+                        <p class="text-base-content/70 text-sm mb-5 leading-relaxed">
+                            Download Here! Just a one click setup and ready to use!
+                        </p>
+
+                        <a href="https://github.com/Thunderstrike597/BGM-AutoPauser/releases"
+                           target="_blank"
+                           rel="noopener noreferrer"
+                           class="bounce-wrap inline-flex">
+                            <span class="release-pill pointer-events-none">
+                                <i class="ti ti-download text-lg"></i>
+                                <span>- LATEST RELEASE</span>
+                            </span>
+                        </a>
+
+                        <div class="flex flex-wrap gap-3 justify-center mt-4 text-xs text-base-content/55">
+                            <span class="flex items-center gap-1.5">
+                                <i class="ti ti-circle-check text-success text-sm"></i> Requires VLC
+                            </span>
+                            <span class="flex items-center gap-1.5">
+                                <i class="ti ti-circle-check text-success text-sm"></i> System Tray App
+                            </span>
+                            <span class="flex items-center gap-1.5">
+                                <i class="ti ti-circle-check text-success text-sm"></i> Auto Pause/Resume
+                            </span>
+                        </div>
+
+                        <p class="text-center text-xs text-base-content/40 mt-3">
+                            Direct from the GitHub releases page
+                        </p>
+                    </div>
+
+                    <div class="w-full h-[3px] rounded-full bg-white/85"></div>
+
+                    <!-- Menu example screenshot -->
+                    <div class="rounded-2xl overflow-hidden">
+                        <img src="images/menu-example.png"
+                             alt="BGM-AutoPauser system tray menu example"
+                             class="w-full"
+                             loading="eager">
+                    </div>
+
+                    <div class="w-full h-[3px] rounded-full bg-white/85"></div>
+
+                    <a href="projects.html"
+                       class="bounce-wrap w-full"
+                       title="My Other Projects">
+                        <span class="projects-pill pointer-events-none">
+                            My Other Projects
+                            <span class="text-2xl sm:text-3xl leading-none font-black" aria-hidden="true">→</span>
+                        </span>
+                    </a>
+
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <div class="section-bar w-full"></div>
+
+    <footer class="w-full py-10 text-center">
+        <p class="text-base-content/40 text-sm mb-3">
+            BGM-AutoPauser — auto pause your music when other audio plays.
+        </p>
+        <a href="https://github.com/Thunderstrike597/BGM-AutoPauser/releases"
+           target="_blank"
+           rel="noopener noreferrer"
+           class="bounce-wrap inline-block">
+            <span class="nav-pill pointer-events-none">
+                View Releases <i class="ti ti-external-link"></i>
+            </span>
+        </a>
+    </footer>
+
+</body>
+</html>
