@@ -23,11 +23,21 @@ already reachable (e.g. it was started with matching flags previously),
 it's left completely alone. Otherwise it's closed and relaunched with the
 interface enabled.
 
-Optional launch argument, meant for a shortcut's "Target"/"Arguments" field:
+Optional launch arguments, meant for a shortcut's "Target"/"Arguments" field:
 
-    "<Dir>\\Background-AutoPause.exe" --launchPlaylist "<Playlist Dir>"
+    "<Dir>\\BGM-AutoPauser.exe" --launchPlaylist "<Playlist Dir>"
+    "<Dir>\\BGM-AutoPauser.exe" --launchVideoStream "<Stream URL>" [--popout]
 
-When given, VLC opens looped/minimized on that folder instead of empty.
+--launchPlaylist opens VLC looped/minimized on that folder instead of empty.
+
+--launchVideoStream instead opens VLC windowed (visible in the taskbar) on
+that stream URL, and forces "Mute instead of pause" on for the session
+(without touching the saved preference used by --launchPlaylist runs) since
+pausing a live stream is more likely to cause problems than muting it.
+Add --popout to also pop the video out into a sizeable, always-on-top
+window. Both of these tray-manageable shortcuts can be created from the
+system tray menu ("New Playlist Shortcut..." / "Add Video Stream
+Shortcut...") rather than built by hand.
 """
 
 import sys
@@ -70,6 +80,7 @@ import comtypes
 from pycaw.pycaw import AudioUtilities, IAudioMeterInformation
 import pystray
 from PIL import Image, ImageDraw
+import yt_dlp
 
 if sys.platform == "win32":
     import winreg
@@ -129,6 +140,13 @@ DEFAULT_VLC_CONFIG = {
     "default_playlist": "",
     "http_port": 8080,
     "http_password": "",   # auto-generated on first run - see load_vlc_config()
+    # Optional: name of a browser ("chrome", "firefox", "edge", "brave", ...)
+    # that's currently logged into the streaming site(s) you use with
+    # --launchVideoStream. When set, yt-dlp authenticates using that
+    # browser's saved login/cookies instead of an anonymous request, which
+    # is what lets it request an ad-free stream on sites/channels where your
+    # subscription grants that benefit. Leave blank for anonymous requests.
+    "ytdlp_cookies_from_browser": "",
 }
 
 LOG_FILE = os.path.join(BASE_DIR, "auto_pauser.log")
@@ -309,6 +327,12 @@ def resolve_vlc_path():
 SHORTCUTS_DIR = os.path.join(BASE_DIR, "playlist-shortcuts")
 SHORTCUTS_BATS_DIR = os.path.join(SHORTCUTS_DIR, "_bats")
 
+# Video-stream shortcuts - same idea as the playlist shortcuts above, but each
+# points at a single stream URL via --launchVideoStream instead of a looped
+# local folder via --launchPlaylist.
+VIDEOSTREAM_SHORTCUTS_DIR = os.path.join(BASE_DIR, "videostream-shortcuts")
+_STREAM_SHORTCUT_NAME_RE = re.compile(r'^StreamShortcut(\d+)$')
+
 _INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
@@ -376,6 +400,76 @@ def create_playlist_shortcut(playlist_dir, name):
 
     return lnk_path
 
+
+def _next_stream_shortcut_name():
+    """Default name for a new video-stream shortcut: 'StreamShortcut1' if
+    that's free, otherwise the lowest-numbered 'StreamShortcut<N>' that
+    isn't already taken by an existing .lnk in videostream-shortcuts/."""
+    existing_numbers = set()
+    try:
+        for fname in os.listdir(VIDEOSTREAM_SHORTCUTS_DIR):
+            stem, ext = os.path.splitext(fname)
+            if ext.lower() != ".lnk":
+                continue
+            m = _STREAM_SHORTCUT_NAME_RE.match(stem)
+            if m:
+                existing_numbers.add(int(m.group(1)))
+    except OSError:
+        pass  # folder doesn't exist yet - no existing shortcuts to avoid
+
+    n = 1
+    while n in existing_numbers:
+        n += 1
+    return f"StreamShortcut{n}"
+
+
+def _is_valid_url(url):
+    from urllib.parse import urlparse
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    return bool(parsed.scheme) and bool(parsed.netloc)
+
+
+def create_videostream_shortcut(url, name, popout):
+    """Creates a direct .lnk shortcut pointing at the application executable
+    with --launchVideoStream (and optionally --popout) baked in, mirroring
+    create_playlist_shortcut() above but for a single stream URL instead of
+    a looped local folder."""
+    os.makedirs(VIDEOSTREAM_SHORTCUTS_DIR, exist_ok=True)
+
+    safe_name = _sanitize_filename(name)
+    lnk_path = _unique_path(os.path.join(VIDEOSTREAM_SHORTCUTS_DIR, safe_name + ".lnk"))
+
+    target_exe = sys.executable
+    popout_suffix = " --popout" if popout else ""
+    if getattr(sys, "frozen", False):
+        arguments = f'--launchVideoStream "{url}"{popout_suffix}'
+    else:
+        # Running from source code (.py file)
+        arguments = f'"{os.path.abspath(__file__)}" --launchVideoStream "{url}"{popout_suffix}'
+
+    ps_lines = [
+        "$s = New-Object -ComObject WScript.Shell",
+        f"$sc = $s.CreateShortcut({_ps_quote(lnk_path)})",
+        f"$sc.TargetPath = {_ps_quote(target_exe)}",
+        f"$sc.Arguments = {_ps_quote(arguments)}",
+        f"$sc.WorkingDirectory = {_ps_quote(BASE_DIR)}",
+        f"$sc.IconLocation = {_ps_quote(target_exe + ',0')}",
+        "$sc.Save()",
+    ]
+
+    script = "\n".join(ps_lines)
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "PowerShell shortcut creation failed")
+
+    return lnk_path
 
 
 def _reveal_in_explorer(path):
@@ -465,10 +559,200 @@ def _new_playlist_shortcut_flow(root):
 
     if open_location:
         _reveal_in_explorer(lnk_path)
-    
 
 
-def ensure_vlc_ready(controller, vlc_cfg, playlist):
+def _ask_videostream_shortcut_details(root, default_name):
+    """Modal dialog: shortcut name, stream URL, and a '--popout' checkbox -
+    laid out label-above-field like the reference screenshot. Returns
+    (name, url, popout), or None if cancelled. The URL is validated before
+    the dialog is allowed to close via OK."""
+    dialog = tk.Toplevel(root)
+    dialog.title("Add Video Stream Shortcut")
+    dialog.resizable(False, False)
+    dialog.attributes("-topmost", True)
+    result = {"value": None}
+
+    tk.Label(dialog, text="Name:").grid(row=0, column=0, sticky="w", padx=12, pady=(12, 2))
+    name_var = tk.StringVar(value=default_name)
+    name_entry = tk.Entry(dialog, textvariable=name_var, width=42)
+    name_entry.grid(row=1, column=0, padx=12, pady=(0, 10), sticky="ew")
+
+    tk.Label(dialog, text="Stream URL:").grid(row=2, column=0, sticky="w", padx=12)
+    url_var = tk.StringVar()
+    url_entry = tk.Entry(dialog, textvariable=url_var, width=42)
+    url_entry.grid(row=3, column=0, padx=12, pady=(0, 10), sticky="ew")
+    url_entry.focus_set()
+
+    popout_var = tk.BooleanVar(value=False)
+    tk.Checkbutton(dialog, text="Pop out video window (--popout)", variable=popout_var).grid(
+        row=4, column=0, sticky="w", padx=12
+    )
+
+    error_var = tk.StringVar(value="")
+    tk.Label(dialog, textvariable=error_var, fg="#d9534f").grid(
+        row=5, column=0, sticky="w", padx=12, pady=(4, 0)
+    )
+
+    def on_ok(event=None):
+        name = name_var.get().strip() or default_name
+        url = url_var.get().strip()
+        if not url or not _is_valid_url(url):
+            error_var.set("Please enter a valid URL (e.g. https://...)")
+            return
+        result["value"] = (name, url, popout_var.get())
+        dialog.destroy()
+
+    def on_cancel(event=None):
+        result["value"] = None
+        dialog.destroy()
+
+    btns = tk.Frame(dialog)
+    btns.grid(row=6, column=0, pady=12)
+    tk.Button(btns, text="OK", command=on_ok, width=10, default="active").pack(side="left", padx=5)
+    tk.Button(btns, text="Cancel", command=on_cancel, width=10).pack(side="left", padx=5)
+
+    dialog.bind("<Return>", on_ok)
+    dialog.bind("<Escape>", on_cancel)
+    dialog.protocol("WM_DELETE_WINDOW", on_cancel)
+
+    dialog.update_idletasks()
+    w, h = dialog.winfo_width(), dialog.winfo_height()
+    sw, sh = dialog.winfo_screenwidth(), dialog.winfo_screenheight()
+    dialog.geometry(f"+{(sw - w) // 2}+{(sh - h) // 2}")
+
+    dialog.grab_set()
+    dialog.wait_window()
+
+    return result["value"]
+
+
+def _new_videostream_shortcut_flow(root):
+    """Runs entirely on the Tk thread: name/URL/popout dialog -> create the
+    shortcut -> always reveal it in Explorer (unlike the playlist flow, this
+    one has no 'open location' checkbox - it always opens per the spec)."""
+    default_name = _next_stream_shortcut_name()
+    details = _ask_videostream_shortcut_details(root, default_name)
+    if details is None:
+        return
+    name, url, popout = details
+
+    try:
+        lnk_path = create_videostream_shortcut(url, name, popout)
+    except Exception as e:
+        logging.error(f"[shortcut] failed to create video stream shortcut: {e}")
+        messagebox.showerror("Shortcut creation failed", f"Something went wrong:\n{e}")
+        return
+
+    _reveal_in_explorer(lnk_path)
+
+
+def _resolve_stream_playback_url(url, vlc_cfg):
+    """VLC has no built-in understanding of a page URL like
+    twitch.tv/<channel> or a YouTube watch link - handing one of those to
+    VLC directly just loads its idle "no media" cone with nothing playing,
+    since VLC has nothing it recognises as a media demux for an HTML page.
+    yt-dlp knows how to resolve that page into the actual direct
+    HLS/DASH/etc. stream URL VLC *can* play.
+
+    Falls back to the original URL unchanged if yt-dlp doesn't recognise it
+    (e.g. the user already pasted a direct .m3u8/stream URL) or resolution
+    fails for any reason (offline stream, network hiccup, site changes,
+    etc.) - better to let VLC attempt the raw URL than give up entirely.
+
+    If vlc_cfg["ytdlp_cookies_from_browser"] names a browser (e.g. "chrome",
+    "firefox", "edge"), yt-dlp authenticates as whatever account is logged
+    into that browser - lets it request the same ad-free stream your
+    subscription would get you in the browser, on sites where the
+    subscriber-ad-free benefit still applies. Requires actually being
+    subscribed/eligible on that channel; not something we can force.
+    """
+    ydl_opts = {"quiet": True, "no_warnings": True, "format": "best", "noplaylist": True}
+    cookies_browser = (vlc_cfg.get("ytdlp_cookies_from_browser") or "").strip()
+    if cookies_browser:
+        ydl_opts["cookiesfrombrowser"] = (cookies_browser,)
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        if info and "entries" in info and info["entries"]:
+            info = info["entries"][0]  # e.g. a channel page resolving to its live entry
+        resolved = info.get("url") if info else None
+        if resolved:
+            logging.info(f"[vlc] resolved '{url}' to a direct playback URL via yt-dlp")
+            return resolved
+    except Exception as e:
+        logging.warning(f"[vlc] yt-dlp couldn't resolve '{url}', using it as-is: {e}")
+    return url
+
+
+_POPOUT_WINDOW_SIZE = (480, 270)   # default pop-out size (16:9) - freely resizable afterward,
+                                    # same as dragging any other window's border
+_POPOUT_MARGIN = 24                # px from the screen edge
+
+
+def _find_top_window_for_pid(pid, timeout=8.0, poll_interval=0.25):
+    """Waits for and returns the HWND of the largest visible top-level
+    window owned by the given process id - i.e. VLC's own main window,
+    grabbed right after we launch it so it can be positioned/sized before
+    the user even sees it appear wherever it last was. Returns None if
+    nothing shows up in time (e.g. VLC failed to start)."""
+    if sys.platform != "win32":
+        return None
+
+    user32 = ctypes.windll.user32
+    deadline = time.time() + timeout
+
+    def _collect_candidates():
+        found = []
+
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+        def _enum_proc(hwnd, _lparam):
+            proc_pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(proc_pid))
+            if proc_pid.value == pid and user32.IsWindowVisible(hwnd):
+                rect = wintypes.RECT()
+                user32.GetWindowRect(hwnd, ctypes.byref(rect))
+                area = max(0, rect.right - rect.left) * max(0, rect.bottom - rect.top)
+                if area > 0:
+                    found.append((area, hwnd))
+            return True
+
+        user32.EnumWindows(_enum_proc, 0)
+        return found
+
+    while time.time() < deadline:
+        candidates = _collect_candidates()
+        if candidates:
+            candidates.sort(reverse=True)  # biggest window first - VLC's main window, not some tooltip
+            return candidates[0][1]
+        time.sleep(poll_interval)
+    return None
+
+
+def _apply_popout_geometry(pid):
+    """Moves/resizes VLC's window into a small corner window - the same
+    thing the user was otherwise doing by hand (drag to resize, Ctrl+H to
+    hide controls) every single time. Runs in its own background thread so
+    it doesn't block ensure_vlc_ready() while it waits for VLC's window to
+    actually appear."""
+    hwnd = _find_top_window_for_pid(pid)
+    if not hwnd:
+        logging.warning("[vlc] popout: never found VLC's window to resize/position")
+        return
+
+    user32 = ctypes.windll.user32
+    screen_w = user32.GetSystemMetrics(0)
+    screen_h = user32.GetSystemMetrics(1)
+    width, height = _POPOUT_WINDOW_SIZE
+    x = max(0, screen_w - width - _POPOUT_MARGIN)
+    y = max(0, screen_h - height - _POPOUT_MARGIN)
+
+    SWP_NOZORDER = 0x0004
+    SWP_SHOWWINDOW = 0x0040
+    user32.SetWindowPos(hwnd, None, x, y, width, height, SWP_NOZORDER | SWP_SHOWWINDOW)
+    logging.info(f"[vlc] popout: positioned window at ({x}, {y}) size {width}x{height}")
+
+
+def ensure_vlc_ready(controller, vlc_cfg, playlist=None, video_stream_url=None, popout=False):
     """Makes sure VLC is reachable over the HTTP interface, without ever
     touching VLC's own Preferences.
 
@@ -513,14 +797,44 @@ def ensure_vlc_ready(controller, vlc_cfg, playlist):
         "--http-host", VLC_HOST,
         "--http-port", str(vlc_cfg.get("http_port", 8080)),
         "--http-password", vlc_cfg.get("http_password", ""),
-        "--qt-start-minimized",
     ]
-    if playlist:
-        launch_args += ["--loop", playlist]
+
+    if video_stream_url:
+        # Windowed and visible in the taskbar (no --qt-start-minimized) -
+        # this is a live stream the user presumably wants to actually watch,
+        # not background music.
+        #
+        # --no-qt-video-autoresize/--autoscale apply regardless of --popout:
+        # VLC's default behaviour is to snap its window back to the video's
+        # *native* resolution any time that resolution changes (e.g. an ad
+        # break creative at a different resolution than the stream) - that's
+        # what was resetting a manually-resized window back to full size.
+        # Disabling autoresize + scaling the video to fit the window instead
+        # keeps whatever size the window actually is.
+        launch_args += ["--no-qt-video-autoresize", "--autoscale"]
+        if popout:
+            # --video-on-top and --qt-minimal-view are both genuine VLC
+            # options - on-top pins the window above others, minimal-view is
+            # the command-line equivalent of the Ctrl+H shortcut (hides the
+            # menu bar/toolbar/controls). Neither one, by itself, sets an
+            # initial size or position though - that's handled below via
+            # _apply_popout_geometry() once the window actually exists,
+            # since VLC has no command-line flag for that part.
+            launch_args += ["--video-on-top", "--qt-minimal-view"]
+        launch_args += [_resolve_stream_playback_url(video_stream_url, vlc_cfg)]
+    else:
+        launch_args += ["--qt-start-minimized"]
+        if playlist:
+            launch_args += ["--loop", playlist]
 
     try:
-        subprocess.Popen(launch_args)
-        logging.info(f"[vlc] launched with web interface enabled (playlist={playlist!r})")
+        proc = subprocess.Popen(launch_args)
+        logging.info(
+            f"[vlc] launched with web interface enabled "
+            f"(playlist={playlist!r}, video_stream_url={video_stream_url!r}, popout={popout})"
+        )
+        if video_stream_url and popout:
+            threading.Thread(target=_apply_popout_geometry, args=(proc.pid,), daemon=True).start()
     except OSError as e:
         logging.error(f"[vlc] failed to launch '{vlc_path}': {e}")
 
@@ -668,13 +982,22 @@ def get_other_audio_peak():
 
 
 class AutoPauser:
-    def __init__(self, vlc_controller: "VLCController"):
+    def __init__(self, vlc_controller: "VLCController", force_mute_mode=False):
         self.vlc = vlc_controller
         self.enabled = True
 
         settings = load_settings()
         self.fade_enabled = settings["fade_enabled"]
-        self.mute_mode = settings["mute_mode"]
+
+        # force_mute_mode is set when launched with --launchVideoStream: live
+        # streams should always be muted rather than paused (see module
+        # docstring / tray menu). self._user_mute_mode tracks the user's
+        # actual saved preference underneath the forced override, so a later
+        # --launchPlaylist run still sees whatever the user last set by hand,
+        # never the forced value from a stream session.
+        self._user_mute_mode = settings["mute_mode"]
+        self.force_mute_mode = force_mute_mode
+        self.mute_mode = True if force_mute_mode else self._user_mute_mode
 
         self._stop = False
         self._sound_since = None
@@ -688,7 +1011,8 @@ class AutoPauser:
         self._original_volume = None   # volume level to fade back up to / restore
 
     def _save_settings(self):
-        save_settings({"fade_enabled": self.fade_enabled, "mute_mode": self.mute_mode})
+        mute_to_save = self._user_mute_mode if self.force_mute_mode else self.mute_mode
+        save_settings({"fade_enabled": self.fade_enabled, "mute_mode": mute_to_save})
 
     def loop(self):
         # pycaw talks to Windows' COM-based audio API, which requires each
@@ -968,6 +1292,8 @@ def _tk_ui_loop(ui_queue: "queue.Queue", pauser: AutoPauser):
                     _show_volume_popup(root, pauser.vlc)
                 elif msg == "new_shortcut":
                     _new_playlist_shortcut_flow(root)
+                elif msg == "new_video_stream_shortcut":
+                    _new_videostream_shortcut_flow(root)
                 elif msg == "quit":
                     root.quit()
                     return
@@ -995,7 +1321,10 @@ def run_tray(pauser: AutoPauser, ui_queue: "queue.Queue"):
         pauser._save_settings()
 
     def toggle_mute_mode(icon, item):
+        if pauser.force_mute_mode:
+            return  # greyed out in the menu already; belt-and-braces here too
         pauser.mute_mode = not pauser.mute_mode
+        pauser._user_mute_mode = pauser.mute_mode
         pauser._save_settings()
 
     def open_volume(icon, item):
@@ -1003,6 +1332,9 @@ def run_tray(pauser: AutoPauser, ui_queue: "queue.Queue"):
 
     def new_shortcut(icon, item):
         ui_queue.put("new_shortcut")
+
+    def new_video_stream_shortcut(icon, item):
+        ui_queue.put("new_video_stream_shortcut")
 
     def quit_app(icon, item):
         pauser.stop()
@@ -1041,9 +1373,11 @@ def run_tray(pauser: AutoPauser, ui_queue: "queue.Queue"):
                 "Mute instead of pause",
                 toggle_mute_mode,
                 checked=lambda item: pauser.mute_mode,
+                enabled=lambda item: not pauser.force_mute_mode,
             ),
             pystray.MenuItem("Volume...", open_volume),
             pystray.MenuItem("New Playlist Shortcut...", new_shortcut),
+            pystray.MenuItem("Add Video Stream Shortcut...", new_video_stream_shortcut),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", quit_app),
             pystray.MenuItem("Close BGM-AutoPause && VLC", quit_app_and_vlc),
@@ -1060,6 +1394,20 @@ def parse_args():
         default=None,
         help="Optional folder VLC should open (looped, minimized) on startup.",
     )
+    parser.add_argument(
+        "--launchVideoStream",
+        dest="video_stream",
+        default=None,
+        help="Optional stream URL VLC should open windowed (visible in the "
+             "taskbar) on startup, instead of a looped/minimized playlist.",
+    )
+    parser.add_argument(
+        "--popout",
+        dest="popout",
+        action="store_true",
+        help="Used with --launchVideoStream: opens the stream in a "
+             "sizeable, always-on-top popped-out window.",
+    )
     args, _unknown = parser.parse_known_args()
     return args
 
@@ -1074,7 +1422,12 @@ def main():
     vlc_cfg = load_vlc_config()
     controller = VLCController(VLC_HOST, vlc_cfg.get("http_port", 8080), vlc_cfg.get("http_password", ""))
 
-    playlist = (args.playlist or vlc_cfg.get("default_playlist") or "").strip() or None
+    video_stream_url = (args.video_stream or "").strip() or None
+    # --launchPlaylist and --launchVideoStream are mutually exclusive; a
+    # stream URL (if given) takes priority since it's the more specific of
+    # the two launch modes.
+    playlist = None if video_stream_url else (args.playlist or vlc_cfg.get("default_playlist") or "").strip() or None
+    popout = bool(args.popout) and video_stream_url is not None
 
     # This used to run inline here, which meant nothing appeared - no tray
     # icon, nothing - until VLC was confirmed reachable or relaunched. Now it
@@ -1083,10 +1436,14 @@ def main():
     # get "unreachable" (None) until this finishes, same as it already
     # handles any other time VLC isn't responding yet.
     threading.Thread(
-        target=ensure_vlc_ready, args=(controller, vlc_cfg, playlist), daemon=True
+        target=ensure_vlc_ready,
+        args=(controller, vlc_cfg, playlist, video_stream_url, popout),
+        daemon=True,
     ).start()
 
-    pauser = AutoPauser(controller)
+    # Launched via --launchVideoStream -> force mute-instead-of-pause for
+    # this session only (see AutoPauser.__init__ / module docstring).
+    pauser = AutoPauser(controller, force_mute_mode=video_stream_url is not None)
     t = threading.Thread(target=pauser.loop, daemon=True)
     t.start()
 

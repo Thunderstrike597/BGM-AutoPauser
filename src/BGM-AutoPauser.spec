@@ -1,10 +1,11 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-# pycaw/comtypes and pystray both do some dynamic importing under the hood
-# (comtypes builds COM interface glue at runtime; pystray picks its Windows
-# backend via importlib) that PyInstaller's static analysis can miss, so
-# these are collected explicitly rather than relying on autodetection.
+# pycaw/comtypes, pystray, and yt_dlp all do some dynamic importing under
+# the hood (comtypes builds COM interface glue at runtime; pystray picks its
+# Windows backend via importlib; yt_dlp loads its per-site extractor modules
+# the same way) that PyInstaller's static analysis can miss, so these are
+# collected explicitly rather than relying on autodetection.
 hiddenimports = ['pystray._win32', 'comtypes.stream']
 # The 'icon=' arg below only stamps the .exe's own file icon (Explorer,
 # taskbar) - it does NOT copy the file anywhere the running app can read it.
@@ -14,7 +15,7 @@ hiddenimports = ['pystray._win32', 'comtypes.stream']
 datas = [('assets/icon.ico', 'assets')]
 binaries = []
 
-for pkg in ('comtypes', 'pycaw'):
+for pkg in ('comtypes', 'pycaw', 'yt_dlp'):
     d, b, h = collect_all(pkg)
     datas += d
     binaries += b

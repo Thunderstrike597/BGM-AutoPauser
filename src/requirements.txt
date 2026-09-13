@@ -1,3 +1,4 @@
 pycaw==20240210
 pystray==0.19.5
 Pillow==12.3.0
+yt-dlp>=2025.1.1
