@@ -132,7 +132,7 @@ def resource_path(*parts):
 
 
 SETTINGS_FILE = os.path.join(BASE_DIR, "auto_pauser_settings.json")
-DEFAULT_SETTINGS = {"fade_enabled": True, "mute_mode": False}
+DEFAULT_SETTINGS = {"fade_enabled": True, "mute_mode": False, "desired_volume_percent": 100}
 
 VLC_CONFIG_FILE = os.path.join(BASE_DIR, "vlc_config.json")
 DEFAULT_VLC_CONFIG = {
@@ -999,6 +999,20 @@ class AutoPauser:
         self.force_mute_mode = force_mute_mode
         self.mute_mode = True if force_mute_mode else self._user_mute_mode
 
+        # Single source of truth for "what volume VLC should be at when
+        # nothing is ducking/fading it" - a plain 0-100 value owned entirely
+        # by this app, never read back from VLC. The previous approach
+        # re-read VLC's own live volume via vlc.get_volume() every time a
+        # duck began (and again on manual disable()), which is exactly what
+        # caused the reported bug: that live value is whatever the fade/mute
+        # logic itself most recently drove it to (including mid-fade, or
+        # already-muted, values like 6% or 0), not the user's real target.
+        # Now it only ever changes in response to the user - via the tray
+        # volume slider (see set_desired_volume_percent) or from whatever
+        # was persisted last session - and duck/undock always target this
+        # value instead of asking VLC what it currently thinks the volume is.
+        self.desired_volume_percent = max(0, min(100, settings.get("desired_volume_percent", 100)))
+
         self._stop = False
         self._sound_since = None
         self._quiet_since = None
@@ -1008,11 +1022,39 @@ class AutoPauser:
         self._fade_state = None        # None, "out", or "in"
         self._fade_start_time = None
         self._fade_start_vol = None
-        self._original_volume = None   # volume level to fade back up to / restore
 
     def _save_settings(self):
         mute_to_save = self._user_mute_mode if self.force_mute_mode else self.mute_mode
-        save_settings({"fade_enabled": self.fade_enabled, "mute_mode": mute_to_save})
+        save_settings({
+            "fade_enabled": self.fade_enabled,
+            "mute_mode": mute_to_save,
+            "desired_volume_percent": self.desired_volume_percent,
+        })
+
+    def _desired_vlc_volume(self):
+        """Converts the persisted 0-100 desired_volume_percent into VLC's
+        native 0-256(+) volume scale."""
+        return self.desired_volume_percent / 100 * VLC_FULL_VOLUME
+
+    def get_desired_volume_percent(self):
+        """What the tray volume slider should display. Deliberately never
+        reads VLC's live volume - while ducked (muted, or faded/paused
+        toward 0) that live value is 0 or mid-fade, not the user's real
+        target."""
+        return self.desired_volume_percent
+
+    def set_desired_volume_percent(self, percent):
+        """Called from the tray volume slider (and once at startup to sync
+        a saved volume onto a freshly launched VLC). Always updates and
+        persists the stored target. Only pushed to VLC immediately if
+        playback isn't currently ducked or mid-fade - if it is, the new
+        value simply becomes what gets applied next time it un-ducks,
+        rather than either briefly making a muted stream audible or getting
+        silently overwritten by the next fade tick."""
+        self.desired_volume_percent = max(0, min(100, percent))
+        self._save_settings()
+        if not self._ducked and self._fade_state is None:
+            self.vlc.set_volume(self._desired_vlc_volume())
 
     def loop(self):
         # pycaw talks to Windows' COM-based audio API, which requires each
@@ -1037,16 +1079,12 @@ class AutoPauser:
             action = "muting" if self.mute_mode else "pausing"
             print(f"[auto-pauser] threshold sustained -> {action}")
 
-        vol = self.vlc.get_volume()
-        if vol is not None:
-            self._original_volume = vol
-        elif self._original_volume is None:
-            self._original_volume = VLC_FULL_VOLUME
-
         if self._fade_is_effective():
             self._fade_state = "out"
             self._fade_start_time = time.time()
-            self._fade_start_vol = self._original_volume
+            # Fades from the desired target, not from whatever VLC's live
+            # volume happens to read right now - see desired_volume_percent.
+            self._fade_start_vol = self._desired_vlc_volume()
         else:
             if self.mute_mode:
                 self.vlc.set_volume(0)
@@ -1071,8 +1109,7 @@ class AutoPauser:
             self._fade_start_time = time.time()
             self._fade_start_vol = 0
         elif self.mute_mode:
-            target = self._original_volume if self._original_volume is not None else VLC_FULL_VOLUME
-            self.vlc.set_volume(target)
+            self.vlc.set_volume(self._desired_vlc_volume())
         # non-mute, non-fade: pause()/play() alone already covers it.
 
         self._ducked = False
@@ -1080,7 +1117,10 @@ class AutoPauser:
     def _advance_fade(self, now):
         elapsed = now - self._fade_start_time
         progress = min(1.0, elapsed / FADE_TIME)
-        target = self._original_volume if self._original_volume is not None else VLC_FULL_VOLUME
+        # Read fresh each tick (rather than snapshotted once) so a volume
+        # change made mid-fade via the tray slider is picked up immediately
+        # instead of being overwritten once the fade finishes.
+        target = self._desired_vlc_volume()
 
         if self._fade_state == "out":
             vol = self._fade_start_vol * (1 - progress)
@@ -1147,11 +1187,11 @@ class AutoPauser:
         self.enabled = False
         self._fade_state = None
         if self.mute_mode:
-            vol = self.vlc.get_volume()
-            if vol is not None:
-                self._original_volume = vol
-            elif self._original_volume is None:
-                self._original_volume = VLC_FULL_VOLUME
+            # No get_volume() read here on purpose - if this fires while
+            # already auto-ducked (VLC's live volume sitting at 0, or
+            # mid-fade), that read used to silently overwrite the real
+            # target with whatever VLC happened to be at. desired_volume_percent
+            # is untouched either way, so re-enabling always restores correctly.
             self.vlc.set_volume(0)
         else:
             self.vlc.pause()
@@ -1168,8 +1208,7 @@ class AutoPauser:
         self._last_loud_at = None
         self._fade_state = None
         if self.mute_mode:
-            target = self._original_volume if self._original_volume is not None else VLC_FULL_VOLUME
-            self.vlc.set_volume(target)
+            self.vlc.set_volume(self._desired_vlc_volume())
         else:
             self.vlc.play()
         self._ducked = False
@@ -1221,10 +1260,13 @@ def _get_cursor_pos():
     return pt.x, pt.y
 
 
-def _show_volume_popup(root, vlc: "VLCController"):
-    current = vlc.get_volume()
-    percent = int(round((current / VLC_FULL_VOLUME) * 100)) if current is not None else 100
-    percent = max(0, min(100, percent))
+def _show_volume_popup(root, pauser: "AutoPauser"):
+    # Reads/writes the app's own desired_volume_percent, never VLC's live
+    # volume - see AutoPauser.set_desired_volume_percent for why. This is
+    # what lets the slider be dragged to set a new target while playback is
+    # currently muted/paused by the auto-pauser, instead of showing (and
+    # fighting with) whatever momentary 0%/mid-fade value VLC is actually at.
+    percent = pauser.get_desired_volume_percent()
 
     popup = tk.Toplevel(root)
     popup.overrideredirect(True)      # no titlebar/border - this is a flyout, not a window
@@ -1246,7 +1288,7 @@ def _show_volume_popup(root, vlc: "VLCController"):
     MIN_SEND_INTERVAL = 0.05  # throttle mid-drag HTTP calls to ~20/sec
 
     def send_volume(pct):
-        vlc.set_volume(pct / 100 * VLC_FULL_VOLUME)
+        pauser.set_desired_volume_percent(pct)
 
     def on_change(raw_value):
         pct = int(float(raw_value))
@@ -1289,7 +1331,7 @@ def _tk_ui_loop(ui_queue: "queue.Queue", pauser: AutoPauser):
             while True:
                 msg = ui_queue.get_nowait()
                 if msg == "volume":
-                    _show_volume_popup(root, pauser.vlc)
+                    _show_volume_popup(root, pauser)
                 elif msg == "new_shortcut":
                     _new_playlist_shortcut_flow(root)
                 elif msg == "new_video_stream_shortcut":
@@ -1412,6 +1454,23 @@ def parse_args():
     return args
 
 
+def _sync_initial_volume_once_ready(pauser: "AutoPauser", controller: "VLCController", timeout=15.0):
+    """Waits for VLC's web interface to come up, then applies whatever
+    desired_volume_percent was loaded/persisted from last session. This is
+    what makes a saved volume below 100% actually take effect on a fresh
+    launch, instead of leaving VLC at whatever it started at (usually full
+    volume) until the next duck/undock cycle happens to touch it. If
+    playback has already been ducked by the time this runs (e.g. other
+    audio was already loud at startup), set_desired_volume_percent skips
+    the live push on its own, same as a slider drag would."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if controller.status(retries=0, timeout=0.75) is not None:
+            pauser.set_desired_volume_percent(pauser.get_desired_volume_percent())
+            return
+        time.sleep(0.5)
+
+
 def main():
     args = parse_args()
 
@@ -1446,6 +1505,12 @@ def main():
     pauser = AutoPauser(controller, force_mute_mode=video_stream_url is not None)
     t = threading.Thread(target=pauser.loop, daemon=True)
     t.start()
+
+    threading.Thread(
+        target=_sync_initial_volume_once_ready,
+        args=(pauser, controller),
+        daemon=True,
+    ).start()
 
     # pystray's message loop and Tk's mainloop each need to own a thread of
     # their own; Tk needs the main thread, so pystray's runs in the
